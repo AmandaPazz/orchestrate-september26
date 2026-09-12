@@ -92,11 +92,12 @@ class UsageTracker:
         return report
 
 
-# Per-million-token rates (USD). Placeholder figures for the Claude Sonnet 5 family used
-# by this project -- verify against current published Anthropic pricing before the final
-# submission run; update here if they've changed.
+# Per-million-token rates (USD). Placeholder figures -- verify against current published
+# pricing for whichever provider actually served the final submission run; update here if
+# they've changed.
 _RATES_PER_MILLION_TOKENS = {
     ("anthropic", "claude-sonnet-5"): (3.00, 15.00),  # (input, output)
+    ("gemini", "gemini-3.6-flash"): (0.30, 2.50),  # (input, output) -- placeholder, verify actual rate
 }
 
 

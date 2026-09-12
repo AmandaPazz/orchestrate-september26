@@ -1,6 +1,15 @@
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Loads ANTHROPIC_API_KEY / GEMINI_API_KEY from a .env file at the repo root into the
+# process environment, if one exists -- so a key set once doesn't need re-exporting in
+# every new shell. Never overrides a variable already set in the real environment
+# (override=False), and does nothing (silently) if no .env file is present -- manual
+# `export`/`$env:` still works exactly as before, this is purely additive.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(REPO_ROOT / ".env", override=False)
 DATASET_DIR = REPO_ROOT / "dataset"
 MEDIA_IMAGES_DIR = DATASET_DIR / "media" / "images"
 CACHE_DIR = REPO_ROOT / "code" / "cache"
@@ -51,6 +60,11 @@ AFFORDABILITY_DOWNGRADE = {
     "not_affordable": "not_affordable",
 }
 
-LLM_PROVIDER = "anthropic"
-VISION_MODEL = "claude-sonnet-5"
-TEXT_MODEL = "claude-sonnet-5"
+# Provider order: Anthropic first if ANTHROPIC_API_KEY is set (env-driven, checked at call
+# time in llm_client.py, never hardcoded here), Gemini as fallback or primary when only
+# GEMINI_API_KEY is set. Both providers' text and vision calls use the same model per
+# provider for simplicity.
+ANTHROPIC_TEXT_MODEL = "claude-sonnet-5"
+ANTHROPIC_VISION_MODEL = "claude-sonnet-5"
+GEMINI_TEXT_MODEL = "gemini-3.6-flash"
+GEMINI_VISION_MODEL = "gemini-3.6-flash"
