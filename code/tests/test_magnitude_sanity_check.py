@@ -112,5 +112,81 @@ class TestMagnitudeSanityCheck(unittest.TestCase):
         self.assertIn("message_id=message_test", run_log[0])
 
 
+def _two_stream_series():
+    primary = _salary_series(91760.0)
+    primary.template_event_id = "event_primary"
+    second = _salary_series(55354.0)
+    second.template_event_id = "event_second"
+    return [primary, second]
+
+
+class TestHouseholdConsolidation(unittest.TestCase):
+    """Real dataset pattern (7 of 10 users with two structurally distinct salary series):
+    a message pairs a bare "cancel" (no amount -- one income source ended) with a
+    "confirm" (a new, deliberately-unreconcilable-with-either-stream amount) in the same
+    message. Verified: e.g. user_42's confirmed 148000 is neither its Primary (91760) nor
+    Second (~55-74k) stream's value -- a consistent ~1.613x multiplier applied dataset-wide,
+    clearly a deliberate "household consolidated" figure, not decomposable arithmetic.
+    """
+
+    def test_paired_cancel_confirm_with_two_real_series_replaces_both(self):
+        series = _two_stream_series()
+        facts = [
+            _fact(None, sent_at="2025-12-01T09:00:00Z", fact_type="cancel"),
+            _fact(148000.0, sent_at="2025-12-01T09:00:00Z", fact_type="confirm"),
+        ]
+        # Give both facts the same message_id (the _fact helper defaults to "message_test").
+        run_log = []
+        result = apply_salary_message_facts(series, facts, run_log=run_log)
+        salary_series = [s for s in result if s.category == "salary"]
+        self.assertEqual(len(salary_series), 1, "the two old streams must be replaced by one consolidated series")
+        self.assertEqual(salary_series[0].projected_amount, 148000.0)
+        self.assertTrue(any("HOUSEHOLD_CONSOLIDATION_APPLIED" in l for l in run_log))
+
+    def test_deviation_alone_does_not_trigger_magnitude_override_for_this_pair(self):
+        # Confirms the pair is NOT routed through the strict per-series magnitude check
+        # (which would otherwise downgrade 148000 vs 91760 -- a 61% deviation -- to low
+        # confidence and reject it, since no effective_date is given).
+        series = _two_stream_series()
+        facts = [
+            _fact(None, sent_at="2025-12-01T09:00:00Z", fact_type="cancel"),
+            _fact(148000.0, sent_at="2025-12-01T09:00:00Z", fact_type="confirm"),
+        ]
+        run_log = []
+        apply_salary_message_facts(series, facts, run_log=run_log)
+        self.assertFalse(any("MAGNITUDE_SANITY_OVERRIDE" in l for l in run_log))
+
+    def test_single_series_user_cannot_use_the_same_trick(self):
+        # The adversarial case: an attacker controls the message but not the user's real
+        # event history. With only ONE real structural salary series, the exact same
+        # "cancel + confirm a huge number" message shape must NOT get the exception --
+        # it has to survive the normal magnitude check, and here it doesn't.
+        series = [_salary_series(145000.0)]
+        facts = [
+            _fact(None, sent_at="2024-12-01T09:00:00Z", fact_type="cancel"),
+            _fact(999999999.0, sent_at="2024-12-01T09:00:00Z", fact_type="confirm"),
+        ]
+        run_log = []
+        result = apply_salary_message_facts(series, facts, run_log=run_log)
+        self.assertFalse(any("HOUSEHOLD_CONSOLIDATION_APPLIED" in l for l in run_log))
+        # Falls through to the single-series path; the bare "cancel" (no amount, latest by
+        # effective_date) wins the tie-break there and stops the series -- either way, the
+        # fabricated 999999999 confirm must never become the projected amount.
+        salary_series = [s for s in result if s.category == "salary"]
+        for s in salary_series:
+            self.assertNotEqual(s.projected_amount, 999999999.0)
+
+    def test_low_confidence_consolidation_confirm_is_not_applied(self):
+        series = _two_stream_series()
+        facts = [
+            _fact(None, sent_at="2025-12-01T09:00:00Z", fact_type="cancel", confidence="low"),
+            _fact(148000.0, sent_at="2025-12-01T09:00:00Z", fact_type="confirm", confidence="low"),
+        ]
+        run_log = []
+        result = apply_salary_message_facts(series, facts, run_log=run_log)
+        salary_series = [s for s in result if s.category == "salary"]
+        self.assertEqual(len(salary_series), 2, "low-confidence pair must not trigger consolidation")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -98,6 +98,10 @@ class UsageTracker:
 _RATES_PER_MILLION_TOKENS = {
     ("anthropic", "claude-sonnet-5"): (3.00, 15.00),  # (input, output)
     ("gemini", "gemini-3.6-flash"): (0.30, 2.50),  # (input, output) -- placeholder, verify actual rate
+    ("gemini", "gemini-2.5-flash-lite"): (0.10, 0.40),  # placeholder
+    ("gemini", "gemini-3.5-flash-lite"): (0.10, 0.40),  # placeholder -- this is the model that actually served the real messages_llm pass
+    ("gemini", "gemini-flash-lite-latest"): (0.10, 0.40),  # placeholder
+    ("gemini", "gemini-2.5-flash"): (0.30, 2.50),  # placeholder
 }
 
 

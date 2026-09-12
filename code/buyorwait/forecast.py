@@ -320,6 +320,37 @@ def _magnitude_sanity_check(
     return result
 
 
+def _find_household_consolidation(
+    salary_facts: list[MessageFact],
+) -> Optional[MessageFact]:
+    """Detects the "one household income record ended, remaining confirmed salary is X"
+    shape: a paired cancel (no amount) + confirm (with amount) from the SAME message.
+    Verified real pattern: 7 of 10 users dataset-wide with two structurally distinct
+    salary series (found via day-of-month clustering: "Primary household salary" + a
+    separate "Second household income") have exactly this message shape, and the
+    confirmed amount consistently doesn't match either individual stream's historical
+    value (it's a restated/consolidated figure, not a simple continuation) -- so it would
+    otherwise always fail the plain per-series magnitude check despite being a clearly
+    legitimate, consistently-templated dataset pattern, not an anomaly.
+
+    Returns the confirm fact if this shape is found in `salary_facts` (already grouped to
+    one user), else None. Caller is responsible for the further gate: only actually use
+    this if the user has >=2 REAL structural salary series (see apply_salary_message_facts)
+    -- an attacker can write anything in a message, but can't fabricate a second series in
+    financial_events.csv, so requiring structural corroboration keeps this from being just
+    a bigger loophole in the magnitude check for a single-stream user.
+    """
+    by_message: dict[str, list[MessageFact]] = {}
+    for f in salary_facts:
+        by_message.setdefault(f.message_id, []).append(f)
+    for group in by_message.values():
+        has_bare_cancel = any(f.fact_type == "cancel" and f.new_amount is None for f in group)
+        confirms = [f for f in group if f.fact_type == "confirm" and f.new_amount is not None]
+        if has_bare_cancel and confirms:
+            return confirms[0]
+    return None
+
+
 def apply_salary_message_facts(
     series_list: list[RecurringSeries],
     salary_facts: list[MessageFact],
@@ -337,20 +368,61 @@ def apply_salary_message_facts(
     (_magnitude_sanity_check) downgrades any "confirm" fact whose claimed amount is a
     wild, unexplained jump from the series' real recent history — see that function's
     docstring. This runs regardless of what the model self-reported.
+
+    Household-consolidation exception: when the user has >=2 structurally-detected salary
+    series AND the message pairs a bare "cancel" with a "confirm" (see
+    _find_household_consolidation), the magnitude check is skipped for that confirm and
+    the whole multi-stream setup is replaced by one new consolidated series at the
+    confirmed amount — gated on real structural corroboration, not just the message's own
+    say-so, so a single-stream user's fabricated "another income ended, salary is now
+    $999,999,999" claim still can't buy its way past the magnitude check this way.
     """
-    salary_idx = next((i for i, s in enumerate(series_list) if s.category == "salary"), None)
+    salary_series_indices = [i for i, s in enumerate(series_list) if s.category == "salary"]
+    result = list(series_list)
+
+    if len(salary_series_indices) >= 2:
+        consolidation_fact = _find_household_consolidation(salary_facts)
+        if consolidation_fact is not None and consolidation_fact.confidence == "high":
+            if run_log is not None:
+                run_log.append(
+                    f"HOUSEHOLD_CONSOLIDATION_APPLIED series_count={len(salary_series_indices)} "
+                    f"new_amount={consolidation_fact.new_amount:g} message_id={consolidation_fact.message_id}"
+                )
+            anchor_date = (
+                (consolidation_fact.new_date - timedelta(days=30))
+                if consolidation_fact.new_date
+                else max(series_list[i].last_known_date for i in salary_series_indices)
+            )
+            result = [s for i, s in enumerate(result) if i not in salary_series_indices]
+            result.append(
+                RecurringSeries(
+                    category="salary",
+                    direction="credit",
+                    interval_days=30,
+                    is_monthly=True,
+                    projected_amount=consolidation_fact.new_amount,
+                    last_known_date=anchor_date,
+                    template_event_id=f"message:{consolidation_fact.message_id}",
+                    flexibility="fixed",
+                    minimum_allowed_amount=None,
+                )
+            )
+            return result
+
+    # Single-series path (the common case; unchanged behavior for every previously
+    # validated real case, since every one of those users has exactly one salary series).
+    salary_idx = salary_series_indices[0] if salary_series_indices else None
     reference_amount = series_list[salary_idx].most_recent_amount if salary_idx is not None else None
     reference_id = series_list[salary_idx].template_event_id if salary_idx is not None else None
     salary_facts = _magnitude_sanity_check(salary_facts, reference_amount, reference_id, run_log)
 
     high_confidence = [f for f in salary_facts if f.confidence == "high"]
     if not high_confidence:
-        return series_list
+        return result
 
     high_confidence.sort(key=lambda f: f.effective_date or date.min)
     latest = high_confidence[-1]
 
-    result = list(series_list)
     salary_idx = next((i for i, s in enumerate(result) if s.category == "salary"), None)
 
     if latest.fact_type == "cancel":

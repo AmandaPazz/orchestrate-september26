@@ -11,6 +11,7 @@ import json
 from typing import Optional
 
 from . import config
+from .formatting import strip_json_fence
 from .io_loader import Event, Image
 from .llm_client import LLMClient
 
@@ -66,7 +67,7 @@ def make_resolver(client: LLMClient, run_log: Optional[list] = None):
                 run_log.append(f"VISION_LLM_CALL_FAILED event_id={event.event_id} image_id={image.image_id} error={e!r}")
             return None, "low"
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(strip_json_fence(raw))
         except (json.JSONDecodeError, TypeError):
             return None, "low"
         if not isinstance(parsed, dict):

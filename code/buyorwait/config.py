@@ -13,7 +13,10 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 DATASET_DIR = REPO_ROOT / "dataset"
 MEDIA_IMAGES_DIR = DATASET_DIR / "media" / "images"
 CACHE_DIR = REPO_ROOT / "code" / "cache"
-EVALUATION_DIR = REPO_ROOT / "evaluation"
+# Matches the organizer's own starter template: code/evaluation/usage_report.md is an
+# empty placeholder shipped in the original repo (git history: commit c280fff "feat: add
+# code folder"), not repo-root evaluation/ -- confirmed by checking git log, not assumed.
+EVALUATION_DIR = REPO_ROOT / "code" / "evaluation"
 OUTPUT_CSV = REPO_ROOT / "output.csv"
 
 REQUESTS_CSV = DATASET_DIR / "requests.csv"
@@ -66,5 +69,22 @@ AFFORDABILITY_DOWNGRADE = {
 # provider for simplicity.
 ANTHROPIC_TEXT_MODEL = "claude-sonnet-5"
 ANTHROPIC_VISION_MODEL = "claude-sonnet-5"
-GEMINI_TEXT_MODEL = "gemini-3.6-flash"
-GEMINI_VISION_MODEL = "gemini-3.6-flash"
+
+# Gemini free-tier daily request quotas are tracked PER MODEL (confirmed directly from a
+# real 429's quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier", model in the
+# quotaDimensions) -- so a chain of distinct models each carries its own separate
+# allowance. Tried in order; llm_client.py's circuit breaker marks a model exhausted the
+# moment it sees a quota-exhaustion error and skips straight past it on every later call
+# in the same process, rather than re-attempting (and waiting out) a doomed request.
+# gemini-3.5-flash-lite is prioritized 2nd: confirmed via the user's real AI Studio
+# dashboard (not a guess) at ~484/500 RPD still available today, vs. gemini-3.6-flash
+# already confirmed exhausted (23/20 RPD) and gemini-2.5-flash-lite/gemini-flash-lite-latest
+# of unknown/partially-used status.
+GEMINI_TEXT_MODEL_CHAIN = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash"]
+GEMINI_VISION_MODEL_CHAIN = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash"]
+
+# Confirmed real cap for gemini-3.5-flash-lite (and used as the safe default for the whole
+# Gemini chain, since per-model RPM isn't individually confirmed for the others): 15
+# requests per minute. This is a pacing constraint, not a daily blocker -- llm_client.py
+# throttles calls to stay under it rather than hitting avoidable 429s.
+GEMINI_RPM_LIMIT = 15
