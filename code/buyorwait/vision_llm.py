@@ -41,21 +41,30 @@ def _build_context_text(event: Event) -> str:
     )
 
 
-def make_resolver(client: LLMClient):
+def make_resolver(client: LLMClient, run_log: Optional[list] = None):
     """Returns an AmountResolver (matching events.py's expected signature) bound to the
-    given LLMClient, for injection into events.resolve_user_events."""
+    given LLMClient, for injection into events.resolve_user_events. A call failure (e.g.
+    no ANTHROPIC_API_KEY configured) is treated the same as an unresolvable amount --
+    events.py already has a tested fallback for that (excluded from the forecast; a debit
+    additionally demotes affordability_status one tier via candidates.py's risk downgrade)
+    rather than crashing the whole run over one image."""
 
     def resolve_amount(event: Event, image: Image) -> tuple[Optional[float], str]:
         image_path = config.MEDIA_IMAGES_DIR / f"{image.image_id}.png"
         if not image_path.exists():
             return None, "low"
 
-        raw = client.call_vision(
-            "vision_llm",
-            VISION_SYSTEM_PROMPT,
-            image_path,
-            _build_context_text(event),
-        )
+        try:
+            raw = client.call_vision(
+                "vision_llm",
+                VISION_SYSTEM_PROMPT,
+                image_path,
+                _build_context_text(event),
+            )
+        except Exception as e:
+            if run_log is not None:
+                run_log.append(f"VISION_LLM_CALL_FAILED event_id={event.event_id} image_id={image.image_id} error={e!r}")
+            return None, "low"
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError):

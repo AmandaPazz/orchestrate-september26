@@ -25,8 +25,9 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
 
-from . import forecast, ranking, spending_changes
+from . import config, events, forecast, ranking, spending_changes
 from .forecast import ForecastResult, RecurringSeries
+from .formatting import format_amount
 from .io_loader import Event, PaymentOption, Profile, Request
 
 
@@ -87,7 +88,7 @@ def _simulate_schedule_safe(
 def _format_plan(schedule: list[tuple[date, float]]) -> str:
     if not schedule:
         return "none"
-    return "|".join(f"{d.isoformat()}:{amount:g}" for d, amount in schedule)
+    return "|".join(f"{d.isoformat()}:{format_amount(amount)}" for d, amount in schedule)
 
 
 def _build_candidates(
@@ -187,12 +188,62 @@ def _build_candidates(
     return out
 
 
+def _apply_risk_downgrade(decision: Decision, resolved_events: list[Event], run_log: Optional[list[str]] = None) -> Decision:
+    """Locked design decision (see events.py): an unresolvable-or-low-confidence DEBIT
+    demotes affordability_status one tier (unless already not_affordable); a credit is
+    just dropped, no downgrade -- already handled by events.py excluding it from the
+    numeric forecast, nothing further needed here. Dormant on the current dataset's
+    deterministic dry run (0 blank-amount events lack a resolvable image) but live once
+    real LLM calls can return confidence="low".
+    """
+    at_risk = events.summarize_forecast_risk(resolved_events)
+    if not at_risk:
+        return decision
+
+    new_status = config.AFFORDABILITY_DOWNGRADE[decision.affordability_status]
+    if run_log is not None:
+        run_log.append(
+            f"AFFORDABILITY_DOWNGRADE_APPLIED from={decision.affordability_status} to={new_status} "
+            f"at_risk_events={[e.event_id for e in at_risk]}"
+        )
+    if new_status == decision.affordability_status:
+        return decision
+
+    if new_status == "not_affordable":
+        # Canonical not_affordable shape (invariant: not_affordable/not_recommended =>
+        # payment_plan == "none") -- the amount itself is untouched, it's still the
+        # baseline value; only the recommendation is withdrawn.
+        return Decision(
+            amount_safe_to_pay=decision.amount_safe_to_pay,
+            affordability_status="not_affordable",
+            recommended_payment_method="not_recommended",
+            payment_plan="none",
+            earliest_date_for_full_payment=decision.earliest_date_for_full_payment,
+            spending_changes_needed="none",
+            winning_candidate=None,
+        )
+
+    # affordable_now -> affordable_with_plan, or affordable_later unchanged (already the
+    # bottom rung before not_affordable): keep the existing method/plan, just the status
+    # reflects the added uncertainty. Rare, dormant path -- flagged rather than perfected.
+    return Decision(
+        amount_safe_to_pay=decision.amount_safe_to_pay,
+        affordability_status=new_status,
+        recommended_payment_method=decision.recommended_payment_method,
+        payment_plan=decision.payment_plan,
+        earliest_date_for_full_payment=decision.earliest_date_for_full_payment,
+        spending_changes_needed=decision.spending_changes_needed,
+        winning_candidate=decision.winning_candidate,
+    )
+
+
 def decide(
     profile: Profile,
     request: Request,
     resolved_events: list[Event],
     series: list[RecurringSeries],
     payment_options: list[PaymentOption],
+    run_log: Optional[list[str]] = None,
 ) -> Decision:
     baseline = forecast.run_forecast(
         profile.current_available_balance,
@@ -207,7 +258,8 @@ def decide(
     winner = ranking.best_candidate(candidates)
 
     if winner is not None:
-        return _decision_from_candidate(winner, baseline, spending_changes_str="none")
+        decision = _decision_from_candidate(winner, baseline, spending_changes_str="none")
+        return _apply_risk_downgrade(decision, resolved_events, run_log)
 
     # Nothing safe without a change -- search for the smallest spending-change
     # combination that makes full_payment safe (only meaningful if the user accepts it).
@@ -233,10 +285,14 @@ def decide(
                 number_of_payments=1,
                 payload=schedule,
             )
-            return _decision_from_candidate(candidate, baseline, spending_changes_str="|".join(change_strings))
+            decision = _decision_from_candidate(candidate, baseline, spending_changes_str="|".join(change_strings))
+            return _apply_risk_downgrade(decision, resolved_events, run_log)
 
-    # Nothing safe at all: not_affordable / not_recommended.
-    return Decision(
+    # Nothing safe at all: not_affordable / not_recommended. (Already the floor -- the
+    # risk downgrade is a no-op here since AFFORDABILITY_DOWNGRADE maps not_affordable to
+    # itself -- but applied anyway for a uniform code path and so the log entry still
+    # fires if an at-risk debit was part of why nothing was affordable.)
+    decision = Decision(
         amount_safe_to_pay=max(0.0, min(baseline.amount_safe_to_pay, request.requested_amount)),
         affordability_status="not_affordable",
         recommended_payment_method="not_recommended",
@@ -245,6 +301,7 @@ def decide(
         spending_changes_needed="none",
         winning_candidate=None,
     )
+    return _apply_risk_downgrade(decision, resolved_events, run_log)
 
 
 def _decision_from_candidate(candidate: ranking.PlanCandidate, baseline: ForecastResult, spending_changes_str: str) -> Decision:

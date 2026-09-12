@@ -21,6 +21,7 @@ from typing import Optional
 
 from . import forecast
 from .forecast import RecurringSeries
+from .formatting import format_amount
 from .io_loader import Event, Profile
 
 
@@ -36,7 +37,7 @@ class ChangeOption:
     def as_output_string(self) -> str:
         if self.action == "stop":
             return f"stop:{self.template_event_id}"
-        return f"reduce_to:{self.template_event_id}:{self.new_amount:g}"
+        return f"reduce_to:{self.template_event_id}:{format_amount(self.new_amount)}"
 
 
 def enumerate_change_options(series_list: list[RecurringSeries], profile: Profile) -> list[ChangeOption]:

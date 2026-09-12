@@ -53,12 +53,21 @@ CallLLM = Callable[[str, str], str]
 """(system_prompt, user_prompt) -> raw model text response."""
 
 
-def make_call_llm(client) -> CallLLM:
+def make_call_llm(client, run_log: Optional[list] = None) -> CallLLM:
     """Adapts an llm_client.LLMClient into the CallLLM signature both extractors expect,
-    tagging calls with the "messages_llm" call_type for usage_tracker.py."""
+    tagging calls with the "messages_llm" call_type for usage_tracker.py. A call failure
+    (e.g. no ANTHROPIC_API_KEY configured) degrades to "no facts extracted" for that one
+    message -- the same effect as scenario 1 in the injection test (a well-behaved model
+    that finds nothing actionable) -- rather than crashing the whole run over one message.
+    """
 
     def _call(system_prompt: str, user_prompt: str) -> str:
-        return client.call_text("messages_llm", system_prompt, user_prompt)
+        try:
+            return client.call_text("messages_llm", system_prompt, user_prompt)
+        except Exception as e:
+            if run_log is not None:
+                run_log.append(f"MESSAGES_LLM_CALL_FAILED error={e!r}")
+            return "[]"
 
     return _call
 
