@@ -32,8 +32,9 @@ conversation for the worked example on user_46 / request_46):
 from __future__ import annotations
 
 import calendar
+import dataclasses
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from . import config
@@ -74,6 +75,9 @@ class RecurringSeries:
     template_event_id: str
     flexibility: str
     minimum_allowed_amount: Optional[float]
+    most_recent_amount: float = 0.0  # the literal last settled/scheduled occurrence's own amount
+    # (distinct from projected_amount, which is the conservative max/min of a trailing
+    # window) -- used as the baseline for the message-fact magnitude sanity check.
     stop_after_date: Optional[date] = None  # set by a high-confidence "cancel" salary fact
 
 
@@ -201,6 +205,7 @@ def _build_series_from_group(
         template_event_id=last.event_id,
         flexibility=last.flexibility,
         minimum_allowed_amount=last.minimum_allowed_amount,
+        most_recent_amount=last.home_currency_amount,
         stop_after_date=last_date if is_terminal else None,
     )
 
@@ -246,9 +251,79 @@ def _add_month(d: date, months: int = 1) -> date:
     return date(y, m, min(d.day, last_day))
 
 
+_MAGNITUDE_DEVIATION_THRESHOLD = 0.50
+
+
+def _sent_date(message_iso_timestamp: str) -> Optional[date]:
+    try:
+        return datetime.fromisoformat(message_iso_timestamp.replace("Z", "+00:00")).date()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _magnitude_sanity_check(
+    salary_facts: list[MessageFact],
+    reference_amount: Optional[float],
+    template_event_id: Optional[str],
+    run_log: Optional[list[str]],
+) -> list[MessageFact]:
+    """Deterministic guard against trusting the model's self-reported confidence alone for
+    an amount change: a "confirm" fact whose new_amount deviates more than 50% from the
+    series' most recent known settled amount gets downgraded to confidence="low"
+    regardless of what the model claimed — UNLESS the fact also carries an explicit
+    effective_date on or after the message's own sent_at (a plausible forward-looking
+    change: a raise, a new contract amount), which is the same shape every real
+    amendment message in this dataset uses (verified: "Regular salary of X resumes on
+    <date>" / "Your first salary will be X, confirmed credit date <date>" are always sent
+    before the date they describe). No reference amount (no existing structural series)
+    means there's nothing to sanity-check against, so those facts pass through unchanged.
+
+    Same category of defense as the structural duplicate-charge check in events.py: don't
+    rely on a single signal (there, linked_event_id; here, the model's self-reported
+    confidence) when a second, independent, deterministic signal is available.
+    """
+    if reference_amount is None or reference_amount <= 0:
+        return salary_facts
+
+    result = []
+    for fact in salary_facts:
+        if fact.fact_type != "confirm" or fact.new_amount is None:
+            result.append(fact)
+            continue
+
+        deviation = abs(fact.new_amount - reference_amount) / reference_amount
+        if deviation <= _MAGNITUDE_DEVIATION_THRESHOLD:
+            result.append(fact)
+            continue
+
+        sent = _sent_date(fact.sent_at)
+        # Strictly AFTER, not on-or-after: every real amendment message in this dataset is
+        # advance notice of a change that takes effect later (12-19 days out in the two
+        # verified examples), not an immediate/same-day/backdated change -- an "effective
+        # today" claim on a wildly different amount is itself the anomalous pattern, not a
+        # plausible raise announcement.
+        plausible_forward_change = (
+            fact.effective_date is not None and sent is not None and fact.effective_date > sent
+        )
+        if plausible_forward_change:
+            result.append(fact)
+            continue
+
+        if fact.confidence == "high" and run_log is not None:
+            run_log.append(
+                f"MAGNITUDE_SANITY_OVERRIDE series={template_event_id} "
+                f"model_claimed_confidence={fact.confidence} "
+                f"reference_amount={reference_amount:g} claimed_new_amount={fact.new_amount:g} "
+                f"deviation={deviation:.1%} message_id={fact.message_id}"
+            )
+        result.append(dataclasses.replace(fact, confidence="low"))
+    return result
+
+
 def apply_salary_message_facts(
     series_list: list[RecurringSeries],
     salary_facts: list[MessageFact],
+    run_log: Optional[list[str]] = None,
 ) -> list[RecurringSeries]:
     """High-confidence salary facts override the structural salary series: a "cancel"
     stops projection after its effective_date; a "confirm" resets the projected amount
@@ -257,7 +332,17 @@ def apply_salary_message_facts(
     exists and the rest of the picture comes entirely from the message). Low-confidence
     facts are ignored; the structural result (or absence of one) stands as the safer
     fallback.
+
+    Before trusting confidence at all, a deterministic magnitude sanity check
+    (_magnitude_sanity_check) downgrades any "confirm" fact whose claimed amount is a
+    wild, unexplained jump from the series' real recent history — see that function's
+    docstring. This runs regardless of what the model self-reported.
     """
+    salary_idx = next((i for i, s in enumerate(series_list) if s.category == "salary"), None)
+    reference_amount = series_list[salary_idx].most_recent_amount if salary_idx is not None else None
+    reference_id = series_list[salary_idx].template_event_id if salary_idx is not None else None
+    salary_facts = _magnitude_sanity_check(salary_facts, reference_amount, reference_id, run_log)
+
     high_confidence = [f for f in salary_facts if f.confidence == "high"]
     if not high_confidence:
         return series_list
